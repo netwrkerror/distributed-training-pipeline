@@ -1,0 +1,28 @@
+# Local working documents — deliberately untracked
+NOTES.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Data and run artifacts
+data/
+checkpoints/
+runs/
+shards/
+
+# macOS
+.DS_Store
