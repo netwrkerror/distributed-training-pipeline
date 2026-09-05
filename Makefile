@@ -5,6 +5,7 @@ NPROC ?= 4
 # nuScenes mini lives outside this repo (9GB); point at it rather than copying.
 DTP_NUSCENES_ROOT ?= /Users/nabh/workspace/repos/github/ray-multimodal-pipeline/data/nuscenes
 CROPS             ?= data/crops.jsonl
+CKPT              ?= checkpoints
 EPOCHS            ?= 10
 
 # Workarounds for a host that cannot resolve its own hostname; see `make doctor`.

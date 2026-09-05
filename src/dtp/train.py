@@ -36,6 +36,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
+from dtp.checkpoint import CheckpointManager
 from dtp.dataset import CropDataset
 from dtp.dist import all_gather_scalar, context_from_env, process_group, setup_logging
 from dtp.metrics import ClassificationMetrics
@@ -132,6 +133,9 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run-dir", default="runs")
+    ap.add_argument("--checkpoint-dir", default="checkpoints")
+    ap.add_argument("--keep-last", type=int, default=3, help="checkpoints to retain, plus best")
+    ap.add_argument("--no-checkpoint", action="store_true", help="disable checkpoint writing")
     ap.add_argument("--backend", default="gloo", help="torch.distributed backend")
     ap.add_argument(
         "--threads",
@@ -267,6 +271,11 @@ def _run(args: argparse.Namespace, ctx) -> None:
                 indent=2,
             )
 
+    checkpoints = CheckpointManager(
+        args.checkpoint_dir, keep_last=args.keep_last, is_master=ctx.is_master
+    )
+    global_step = 0
+
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
         if train_sampler is not None and not args.no_set_epoch:
@@ -276,6 +285,7 @@ def _run(args: argparse.Namespace, ctx) -> None:
         train_metrics, step_times = train_one_epoch(
             model, train_loader, criterion, optimizer, num_classes, args.sync_each_step
         )
+        global_step += len(step_times)
         val_metrics = evaluate(model, val_loader, criterion, num_classes)
         epoch_s = time.perf_counter() - epoch_start
 
@@ -326,6 +336,26 @@ def _run(args: argparse.Namespace, ctx) -> None:
                 [round(x, 5) for x in rank_losses],
                 loss_spread,
             )
+
+        if not args.no_checkpoint:
+            # sampler_epoch is stored so a resumed run continues the data order rather
+            # than replaying it from epoch 0. A7 depends on this being right.
+            meta = checkpoints.save(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                global_step=global_step,
+                sampler_epoch=epoch,
+                val_loss=val_metrics.loss,
+            )
+            if meta is not None:
+                log.info(
+                    "checkpoint %s (step %d, val_loss %.4f, sha %s)",
+                    meta.filename,
+                    meta.global_step,
+                    meta.val_loss,
+                    meta.sha256[:12],
+                )
 
     if ctx.is_master:
         log.info("wrote %s", metrics_path)

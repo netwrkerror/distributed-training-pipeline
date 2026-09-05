@@ -18,6 +18,9 @@ import sys
 
 import pytest
 
+from dtp.checkpoint import CheckpointManager
+from dtp.model import SmallCNN
+
 TORCHRUN = [
     sys.executable,
     "-m",
@@ -116,3 +119,48 @@ def test_exception_on_one_rank_does_not_hang_the_job(tmp_path) -> None:
     output = result.stdout + result.stderr
     assert result.returncode != 0, f"job should have failed\n{output}"
     assert "deliberate failure on rank 2" in output, output
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.exists(MANIFEST), reason="run `make crops` first")
+def test_only_rank_zero_writes_checkpoints(tmp_path) -> None:
+    """A6 under real processes: one writer, and the result loads unwrapped.
+
+    The single-process tests use a stand-in for DistributedDataParallel, because real
+    DDP needs a process group. This is the one that proves the `module.` prefix is
+    actually stripped from a checkpoint written by a genuine DDP-wrapped model.
+    """
+    ckpt_dir = tmp_path / "checkpoints"
+    result = _run(
+        [
+            "-m",
+            "dtp.train",
+            "--epochs",
+            "2",
+            "--batch-size",
+            "256",
+            "--checkpoint-dir",
+            str(ckpt_dir),
+            "--run-dir",
+            str(tmp_path / "runs"),
+        ],
+        port="29614",
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+
+    written = sorted(p.name for p in ckpt_dir.glob("ckpt_epoch*.pt"))
+    assert written == ["ckpt_epoch0000.pt", "ckpt_epoch0001.pt"], (
+        f"expected exactly one writer, got {written}\n{output}"
+    )
+    assert not list(ckpt_dir.glob("*.tmp")), "temp files survived"
+
+    manager = CheckpointManager(ckpt_dir)
+    meta = manager.read_marker()
+    assert meta is not None and meta.world_size == 4
+    state = manager.load()  # verifies the checksum
+    assert state["epoch"] == 1
+    assert not any(k.startswith("module.") for k in state["model"]), (
+        "checkpoint written by a real DDP-wrapped model kept the module. prefix"
+    )
+    SmallCNN(10).load_state_dict(state["model"])  # strict=True
