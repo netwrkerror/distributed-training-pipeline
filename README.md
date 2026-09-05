@@ -25,7 +25,7 @@ inference, this one is training. `src/dtp/manifest.py` is copied from it, with a
 | A3 | Single-process training baseline | ✅ |
 | A4 | DDP wrapper | ✅ |
 | A5 | DistributedSampler and the no-duplicate assertion | ✅ |
-| A6 | Checkpointing | ⬜ |
+| A6 | Checkpointing | ✅ |
 | A7 | Resume | ⬜ |
 | A8 | Fault injection and recovery | ⬜ |
 | **B — Measure and fix the input pipeline** | | |
@@ -65,6 +65,17 @@ box inside it — plus a `.classes.json` sidecar. 4,104 crops across 10 classes 
 keyframes, with the long-tailed distribution you would expect (car 48.0%, trailer 0.4%).
 
 ## Notes from the work so far
+
+**A corrupt checkpoint does not announce itself.** `torch.save` writes a zip container, so a
+*truncated* checkpoint is caught by the format. A single flipped byte is not: the file loads
+without complaint, the weights come back finite and plausibly scaled, and training resumes from
+silently wrong parameters. Measured on a real checkpoint — byte flips at 50% and 90% of the file
+both loaded happily. Checkpoints here record a sha256 in the marker and verify it on load.
+
+**Checkpoint writes are atomic**: temp file in the destination directory → `fsync` the file →
+`os.replace` → `fsync` the directory. The naive `torch.save(state, "latest.pt")` overwrites the
+only good copy in place, so a crash during the write destroys the checkpoint you were keeping in
+order to survive crashes.
 
 **Sharding is where distribution finally pays.** Without `DistributedSampler` all four ranks
 iterate the whole dataset: 32.6s per epoch to reproduce the single-process result exactly. With
