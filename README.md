@@ -24,7 +24,7 @@ inference, this one is training. `src/dtp/manifest.py` is copied from it, with a
 | A2 | Dataset layer: nuScenes crops | ✅ |
 | A3 | Single-process training baseline | ✅ |
 | A4 | DDP wrapper | ✅ |
-| A5 | DistributedSampler and the no-duplicate assertion | ⬜ |
+| A5 | DistributedSampler and the no-duplicate assertion | ✅ |
 | A6 | Checkpointing | ⬜ |
 | A7 | Resume | ⬜ |
 | A8 | Fault injection and recovery | ⬜ |
@@ -49,6 +49,7 @@ make hello      # 4-process gloo hello-world: rank, world_size, and a checked al
 make train      # single-process training baseline
 make ddp        # the same loop across 4 gloo processes
 make check-ddp  # assert DDP really averages gradients across ranks
+make check-sampler  # assert the ranks partition the dataset exactly
 make test       # fast tests
 make test-all   # everything, including the 4-process run
 ```
@@ -64,6 +65,23 @@ box inside it — plus a `.classes.json` sidecar. 4,104 crops across 10 classes 
 keyframes, with the long-tailed distribution you would expect (car 48.0%, trailer 0.4%).
 
 ## Notes from the work so far
+
+**Sharding is where distribution finally pays.** Without `DistributedSampler` all four ranks
+iterate the whole dataset: 32.6s per epoch to reproduce the single-process result exactly. With
+it, each rank takes a disjoint 802-record shard and the epoch drops to 7.2s — 2.8× faster than
+the 20.4s single-process baseline.
+
+**`DistributedSampler` pads, so "no duplicates" is not quite true.** Every rank must run the same
+number of steps, or one reaches the next collective alone and blocks. When the dataset does not
+divide evenly, `drop_last=False` repeats records from the front of the permutation: coverage is
+complete but `world_size - (n % world_size)` records appear twice in one epoch. The real split
+hides this (3208 and 896 are both divisible by 4); the tests assert the general case.
+
+**Learning-rate scaling made convergence worse, and it is reported that way.** At a real
+effective batch of 256, six epochs each: unscaled `3e-3` → 0.6031, √-scaled `6e-3` → 0.6679,
+linearly scaled `1.2e-2` → 0.7174. Monotonically worse with more scaling. The linear rule is SGD
+folklore that assumes a warmup this run does not have, and AdamW already decouples step size from
+gradient magnitude. Left unscaled by default.
 
 **Most of DDP's apparent slowdown was a launcher default, not the framework.** A naive
 before/after says DDP cost 2.4× per step (120.3ms → 284.6ms). Decomposed: single-process with

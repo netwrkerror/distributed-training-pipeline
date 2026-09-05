@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DistributedSampler
 
 from dtp.dist import process_group, setup_logging
 from dtp.model import SmallCNN
@@ -116,7 +117,72 @@ def gradient_sync() -> int:
         return 0 if ok else 1
 
 
-CHECKS = {"gradient-sync": gradient_sync}
+def sampler_coverage() -> int:
+    """Assert the real partition across real processes, and expose gotcha 1.
+
+    `tests/test_sampler.py` checks the same properties by constructing all four ranks'
+    samplers inside one process, which is a stronger test in most respects. This one
+    is complementary: it verifies that the ranks a *live job* actually has agree, so
+    it would catch a rank misreading its own rank or world size from the environment -
+    something the simulated version assumes correct by construction.
+    """
+    with process_group() as ctx:
+        log = setup_logging(ctx, master_only=True)
+        if not ctx.is_distributed:
+            log.warning("sampler-coverage needs world_size > 1; run it under torchrun")
+            return 1
+
+        n = 3208
+        dataset = list(range(n))
+        sampler = DistributedSampler(dataset, shuffle=True, seed=0)
+
+        ok = True
+        orders: list[list[int]] = []
+        for epoch in range(3):
+            sampler.set_epoch(epoch)
+            local = list(sampler)
+            orders.append(local)
+
+            gathered: list[list[int]] = [None] * ctx.world_size  # type: ignore[list-item]
+            dist.all_gather_object(gathered, local)
+            union = [i for shard in gathered for i in shard]
+
+            exact = sorted(union) == dataset
+            no_overlap = len(set(union)) == len(union)
+            equal_sizes = len({len(shard) for shard in gathered}) == 1
+            ok = ok and exact and no_overlap and equal_sizes
+            log.info(
+                "epoch %d: %d indices over %d ranks | covers_exactly=%s no_overlap=%s "
+                "equal_shards=%s",
+                epoch,
+                len(union),
+                ctx.world_size,
+                exact,
+                no_overlap,
+                equal_sizes,
+            )
+
+        changed = len({tuple(o) for o in orders}) == len(orders)
+        log.info("order differs every epoch with set_epoch: %s", changed)
+        ok = ok and changed
+
+        # gotcha 1: the same sampler, never told which epoch it is
+        frozen = DistributedSampler(dataset, shuffle=True, seed=0)
+        repeats = [list(frozen) for _ in range(3)]
+        identical = repeats[0] == repeats[1] == repeats[2]
+        log.info(
+            "without set_epoch, every epoch is identical: %s  (this is the bug, and it "
+            "never crashes and never logs)",
+            identical,
+        )
+        ok = ok and identical
+
+        log.info("sampler-coverage: %s", "PASS" if ok else "FAIL")
+        dist.barrier()
+        return 0 if ok else 1
+
+
+CHECKS = {"gradient-sync": gradient_sync, "sampler-coverage": sampler_coverage}
 
 
 def main() -> int:
