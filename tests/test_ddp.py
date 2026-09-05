@@ -12,6 +12,7 @@ The loopback flags are required on a host that cannot resolve its own hostname; 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 
@@ -51,8 +52,15 @@ def test_gradient_sync_across_ranks() -> None:
 
 @pytest.mark.slow
 @pytest.mark.skipif(not os.path.exists(MANIFEST), reason="run `make crops` first")
-def test_four_rank_training_run_agrees_and_exits() -> None:
-    """The A4 done-when: 4 processes complete, agree, and the job exits cleanly.
+def test_four_rank_training_run_completes_and_exits() -> None:
+    """4 processes complete and the job exits cleanly.
+
+    In A4 this asserted `spread=0.00e+00`. That assertion was correct then and is
+    wrong now, and the change is the point of A5: once DistributedSampler gives each
+    rank a different shard, per-rank losses *must* differ, because they are computed
+    over different data. Loss agreement was never evidence of gradient
+    synchronisation - `test_gradient_sync_across_ranks` asserts that property
+    directly, and it is what still guarantees the ranks train one shared model.
 
     A hang here fails on the subprocess timeout rather than blocking forever, which
     is the difference between a test suite and a wedged terminal.
@@ -60,8 +68,29 @@ def test_four_rank_training_run_agrees_and_exits() -> None:
     result = _run(["-m", "dtp.train", "--epochs", "1", "--batch-size", "128"], port="29611")
     output = result.stdout + result.stderr
     assert result.returncode == 0, f"torchrun exited {result.returncode}\n{output}"
-    assert "spread=0.00e+00" in output, f"ranks disagreed on the loss\n{output}"
     assert "world_size=4" in output, output
+
+    spread = re.search(r"spread=([0-9.e+-]+)", output)
+    assert spread, f"no per-rank loss spread reported\n{output}"
+    assert float(spread.group(1)) > 0, (
+        "per-rank losses were identical, so the ranks are sharing data: "
+        "DistributedSampler is not partitioning\n" + output
+    )
+
+
+@pytest.mark.slow
+def test_sampler_partitions_across_real_processes() -> None:
+    """The A5 done-when, verified by the ranks a live job actually has.
+
+    tests/test_sampler.py checks the same properties more thoroughly in one process.
+    This catches what that one assumes: that each rank reads its own rank and world
+    size correctly from the environment.
+    """
+    result = _run(["-m", "dtp.checks", "sampler-coverage"], port="29613")
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, f"sampler-coverage failed\n{output}"
+    assert "sampler-coverage: PASS" in output, output
+    assert "covers_exactly=True no_overlap=True equal_shards=True" in output, output
 
 
 @pytest.mark.slow

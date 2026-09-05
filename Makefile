@@ -1,4 +1,4 @@
-.PHONY: install lint fmt test test-all hello probe doctor crops train ddp check-ddp check
+.PHONY: install lint fmt test test-all hello probe doctor crops train ddp check-ddp check-sampler check
 
 NPROC ?= 4
 
@@ -45,6 +45,10 @@ ddp:                ## A4 done-when: same loop under DDP across $(NPROC) gloo pr
 check-ddp:          ## assert DDP really averages gradients across ranks
 	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
 		-m dtp.checks gradient-sync
+
+check-sampler:      ## assert the ranks partition the dataset exactly, and show gotcha 1
+	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
+		-m dtp.checks sampler-coverage
 
 probe:              ## report how DataLoader workers are started on this machine
 	uv run python -m dtp.probe

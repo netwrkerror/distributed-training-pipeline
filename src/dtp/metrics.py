@@ -13,6 +13,7 @@ model ignoring the tail cannot hide in it.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 
 
 class ClassificationMetrics:
@@ -60,6 +61,26 @@ class ClassificationMetrics:
         """Mean recall over classes that actually appear. NaN classes are skipped."""
         recalls = [r for r in self.per_class_recall() if r == r]
         return sum(recalls) / max(1, len(recalls))
+
+    def all_reduce(self) -> None:
+        """Sum this rank's counts into every rank's, in place.
+
+        Metrics have to be *reduced*, not sampled. Once DistributedSampler gives each
+        rank a different shard, rank 0's local accuracy is computed over a quarter of
+        the validation set - a number that is not wrong so much as answering a
+        different question, and one that moves around as the shuffle changes. Summing
+        the confusion matrices gives the metric over the whole set.
+
+        Note this reduces *counts*, not rates. Averaging four ranks' accuracies would
+        also be wrong whenever their shards differ in size.
+        """
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        dist.all_reduce(self.confusion, op=dist.ReduceOp.SUM)
+        totals = torch.tensor([self.loss_sum, float(self.n)], dtype=torch.float64)
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        self.loss_sum = float(totals[0])
+        self.n = int(totals[1])
 
     def summary(self, classes: list[str]) -> dict:
         return {

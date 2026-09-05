@@ -13,11 +13,10 @@ Written single-process but *not* single-process-only: rank and world size come f
 `context_from_env`, which returns rank 0 of world 1 when torchrun is absent. A4 wraps
 the model in DistributedDataParallel without rewriting the loop.
 
-A4 deliberately does NOT use DistributedSampler - that is A5. Every rank therefore
-iterates the whole dataset in the same order, computes identical gradients, and
-averaging identical gradients changes nothing. The four-process run should reproduce
-the single-process loss curve while doing four times the work. That is the
-duplicated-data pathology, demonstrated on purpose so A5 has something to fix.
+A5 adds DistributedSampler, so the ranks finally see different data. Two consequences
+worth expecting: per-rank losses stop being identical (they are computed over
+different shards, which is the point), and metrics must be reduced across ranks
+rather than read off rank 0.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from dtp.dataset import CropDataset
 from dtp.dist import all_gather_scalar, context_from_env, process_group, setup_logging
@@ -144,6 +143,18 @@ def main() -> None:
         "incomparable",
     )
     ap.add_argument(
+        "--lr-scale",
+        choices=("none", "linear"),
+        default="none",
+        help="linear multiplies lr by world_size (Goyal et al.). Meaningful only once "
+        "ranks see different data, i.e. from A5 onward",
+    )
+    ap.add_argument(
+        "--no-set-epoch",
+        action="store_true",
+        help="skip sampler.set_epoch (gotcha 1): freezes the shuffle at epoch 0",
+    )
+    ap.add_argument(
         "--log-all-ranks",
         action="store_true",
         help="log progress from every rank, not just rank 0",
@@ -179,17 +190,36 @@ def _run(args: argparse.Namespace, ctx) -> None:
     train_idx, val_idx = splitter(dataset.records, args.val_fraction, args.seed)
     num_classes = len(dataset.classes)
 
+    train_subset = Subset(dataset, train_idx)
+    val_subset = Subset(dataset, val_idx)
+
+    # DataLoader refuses shuffle=True alongside a sampler, because the sampler owns
+    # ordering. The shuffling moves into DistributedSampler, which produces the same
+    # permutation on every rank and then strides it by rank.
+    train_sampler = (
+        DistributedSampler(train_subset, shuffle=True, seed=args.seed, drop_last=False)
+        if ctx.is_distributed
+        else None
+    )
+    val_sampler = (
+        DistributedSampler(val_subset, shuffle=False, drop_last=False)
+        if ctx.is_distributed
+        else None
+    )
+
     train_loader = DataLoader(
-        Subset(dataset, train_idx),
+        train_subset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         drop_last=False,
     )
     val_loader = DataLoader(
-        Subset(dataset, val_idx),
+        val_subset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
     )
 
@@ -199,7 +229,12 @@ def _run(args: argparse.Namespace, ctx) -> None:
         # device_ids=[ctx.local_rank], which is what makes each rank own one GPU.
         model = DistributedDataParallel(model)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # One optimizer step now consumes per_device_batch * world_size samples, so an
+    # epoch is world_size times fewer steps. The linear scaling rule compensates by
+    # taking proportionally larger steps. It is a heuristic, not a theorem, and it is
+    # known to need warmup at large scale.
+    lr = args.lr * (ctx.world_size if args.lr_scale == "linear" else 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
 
     # Only rank 0 writes. Four processes creating the same timestamped directory and
     # appending to the same file would interleave lines and race on creation.
@@ -210,7 +245,7 @@ def _run(args: argparse.Namespace, ctx) -> None:
 
     log.info(
         "dataset=%d train=%d val=%d classes=%d params=%s threads=%d split=%s "
-        "world_size=%d per_device_batch=%d effective_batch=%d",
+        "world_size=%d per_device_batch=%d effective_batch=%d lr=%.2e (%s)",
         len(dataset),
         len(train_idx),
         len(val_idx),
@@ -221,6 +256,8 @@ def _run(args: argparse.Namespace, ctx) -> None:
         ctx.world_size,
         args.batch_size,
         args.batch_size * ctx.world_size,
+        lr,
+        args.lr_scale,
     )
     if ctx.is_master:
         with open(run_dir / "config.json", "w") as fh:
@@ -232,16 +269,28 @@ def _run(args: argparse.Namespace, ctx) -> None:
 
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
+        if train_sampler is not None and not args.no_set_epoch:
+            # Without this the sampler stays on epoch 0 and reshuffles to the same
+            # permutation forever. Nothing crashes; the data order simply freezes.
+            train_sampler.set_epoch(epoch)
         train_metrics, step_times = train_one_epoch(
             model, train_loader, criterion, optimizer, num_classes, args.sync_each_step
         )
         val_metrics = evaluate(model, val_loader, criterion, num_classes)
         epoch_s = time.perf_counter() - epoch_start
 
-        # The A4 done-when, as a number rather than an impression. With gradients
-        # synchronised the ranks are training one model, so their losses must agree.
+        # Captured *before* reduction: from A5 onward each rank trains on a different
+        # shard, so these are expected to differ. They agreed exactly in A4 only
+        # because every rank saw identical data - which is why loss agreement was
+        # never evidence that gradients were being synchronised. `make check-ddp`
+        # asserts that property directly.
         rank_losses = all_gather_scalar(train_metrics.loss)
         loss_spread = max(rank_losses) - min(rank_losses)
+
+        # Metrics are summed over ranks, not taken from rank 0, which after sharding
+        # would report over a quarter of the data.
+        train_metrics.all_reduce()
+        val_metrics.all_reduce()
 
         record = {
             "epoch": epoch,
