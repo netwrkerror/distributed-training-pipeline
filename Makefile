@@ -1,4 +1,4 @@
-.PHONY: install lint fmt test test-all hello probe doctor crops train check
+.PHONY: install lint fmt test test-all hello probe doctor crops train ddp check-ddp check
 
 NPROC ?= 4
 
@@ -37,6 +37,14 @@ crops:              ## build the crop manifest from nuScenes (run once)
 
 train:              ## A3 done-when: single-process baseline (scene-level split)
 	uv run python -m dtp.train --epochs $(EPOCHS)
+
+ddp:                ## A4 done-when: same loop under DDP across $(NPROC) gloo processes
+	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
+		-m dtp.train --epochs $(EPOCHS)
+
+check-ddp:          ## assert DDP really averages gradients across ranks
+	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
+		-m dtp.checks gradient-sync
 
 probe:              ## report how DataLoader workers are started on this machine
 	uv run python -m dtp.probe

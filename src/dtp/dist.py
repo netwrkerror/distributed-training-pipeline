@@ -52,20 +52,47 @@ def context_from_env(env: dict[str, str] | None = None) -> DistContext:
     )
 
 
-def setup_logging(ctx: DistContext, level: int = logging.INFO) -> logging.Logger:
+def setup_logging(
+    ctx: DistContext, level: int = logging.INFO, master_only: bool = False
+) -> logging.Logger:
     """Rank-tagged logging.
 
     Interleaved output from N processes is unreadable without the rank on every
     line, and 'which rank printed this' is the first question of every distributed
     debugging session.
+
+    `master_only` raises the level on non-zero ranks so that routine progress is
+    printed once rather than `world_size` times. It deliberately raises to WARNING
+    rather than silencing: a rank that has something to complain about must still be
+    able to, or the failure mode is a job that dies quietly on rank 3.
     """
+    effective = level if (ctx.is_master or not master_only) else logging.WARNING
     logging.basicConfig(
-        level=level,
+        level=effective,
         format=f"%(asctime)s [rank {ctx.rank}/{ctx.world_size}] %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
         force=True,
     )
-    return logging.getLogger("dtp")
+    logger = logging.getLogger("dtp")
+    logger.setLevel(effective)
+    return logger
+
+
+def all_gather_scalar(value: float) -> list[float]:
+    """Collect one float from every rank onto every rank.
+
+    Used to check that per-rank losses agree. Doing this with a collective rather
+    than by scraping log lines matters: it turns "the numbers looked similar" into an
+    assertion the job can make about itself.
+    """
+    if not dist.is_initialized():
+        return [value]
+    import torch
+
+    tensor = torch.tensor([value], dtype=torch.float64)
+    gathered = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor)
+    return [float(t.item()) for t in gathered]
 
 
 @contextmanager
