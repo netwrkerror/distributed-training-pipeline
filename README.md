@@ -23,7 +23,7 @@ inference, this one is training. `src/dtp/manifest.py` is copied from it, with a
 | A1 | Repo scaffold and dev environment | ✅ |
 | A2 | Dataset layer: nuScenes crops | ✅ |
 | A3 | Single-process training baseline | ✅ |
-| A4 | DDP wrapper | ⬜ |
+| A4 | DDP wrapper | ✅ |
 | A5 | DistributedSampler and the no-duplicate assertion | ⬜ |
 | A6 | Checkpointing | ⬜ |
 | A7 | Resume | ⬜ |
@@ -47,6 +47,8 @@ make install    # create the venv and install dependencies
 make doctor     # check the host for defects that make distributed runs hang
 make hello      # 4-process gloo hello-world: rank, world_size, and a checked all_reduce
 make train      # single-process training baseline
+make ddp        # the same loop across 4 gloo processes
+make check-ddp  # assert DDP really averages gradients across ranks
 make test       # fast tests
 make test-all   # everything, including the 4-process run
 ```
@@ -62,6 +64,19 @@ box inside it — plus a `.classes.json` sidecar. 4,104 crops across 10 classes 
 keyframes, with the long-tailed distribution you would expect (car 48.0%, trailer 0.4%).
 
 ## Notes from the work so far
+
+**Most of DDP's apparent slowdown was a launcher default, not the framework.** A naive
+before/after says DDP cost 2.4× per step (120.3ms → 284.6ms). Decomposed: single-process with
+one thread is already 226.9ms, because `torchrun` sets `OMP_NUM_THREADS=1` while a bare
+`python` run used seven threads. So 1.9× is threading and only 1.25× is gradient
+synchronisation. Comparing a launched run against an unlaunched one measures the launcher.
+
+**"Per-rank losses agree" does not prove gradients are synchronised.** With every rank seeing
+identical data from identical initial weights, the losses agree whether or not the all-reduce
+runs at all — so the obvious done-when is satisfiable by a broken implementation. `make check-ddp`
+asserts the real property: ranks given deliberately *different* data end up with bit-identical
+gradients equal to the mean of their independent local ones (agreement 1.5e-08, cross-rank
+disagreement 0.0, local gradients differing by 4.6e-01 so the check cannot pass vacuously).
 
 **Validation is split by scene, and the number is much worse for it.** There are ~10 crops per
 camera frame and consecutive frames show the same objects, so a record-level split puts
