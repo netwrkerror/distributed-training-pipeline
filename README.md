@@ -22,7 +22,7 @@ inference, this one is training. `src/dtp/manifest.py` is copied from it, with a
 | **A — DDP mechanics on CPU** | | |
 | A1 | Repo scaffold and dev environment | ✅ |
 | A2 | Dataset layer: nuScenes crops | ✅ |
-| A3 | Single-process training baseline | ⬜ |
+| A3 | Single-process training baseline | ✅ |
 | A4 | DDP wrapper | ⬜ |
 | A5 | DistributedSampler and the no-duplicate assertion | ⬜ |
 | A6 | Checkpointing | ⬜ |
@@ -46,6 +46,7 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). CPU only.
 make install    # create the venv and install dependencies
 make doctor     # check the host for defects that make distributed runs hang
 make hello      # 4-process gloo hello-world: rank, world_size, and a checked all_reduce
+make train      # single-process training baseline
 make test       # fast tests
 make test-all   # everything, including the 4-process run
 ```
@@ -61,6 +62,14 @@ box inside it — plus a `.classes.json` sidecar. 4,104 crops across 10 classes 
 keyframes, with the long-tailed distribution you would expect (car 48.0%, trailer 0.4%).
 
 ## Notes from the work so far
+
+**Validation is split by scene, and the number is much worse for it.** There are ~10 crops per
+camera frame and consecutive frames show the same objects, so a record-level split puts
+near-duplicate crops of the same car on both sides. Measured directly: under a random split
+validation accuracy reaches 0.72–0.76 and val loss tracks train loss; under a scene-level split
+the same model gets 0.27–0.65 and val loss has no trend at all. The first number is the one a
+careless write-up would report. Training loss falls monotonically (1.14 → 0.23 over 10 epochs)
+either way — the loop is correct; the model simply does not generalise across scenes yet.
 
 **Run `make doctor` before anything else.** On a host that cannot resolve its own hostname, bare
 `torchrun` never completes rendezvous — it retries a failing lookup with exponential backoff and
