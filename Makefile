@@ -1,6 +1,10 @@
-.PHONY: install lint fmt test test-all hello probe doctor check
+.PHONY: install lint fmt test test-all hello probe doctor crops check
 
 NPROC ?= 4
+
+# nuScenes mini lives outside this repo (9GB); point at it rather than copying.
+DTP_NUSCENES_ROOT ?= /Users/nabh/workspace/repos/github/ray-multimodal-pipeline/data/nuscenes
+CROPS             ?= data/crops.jsonl
 
 # Workarounds for a host that cannot resolve its own hostname; see `make doctor`.
 # --local-addr stops the elastic agent advertising an unresolvable FQDN to its workers.
@@ -26,6 +30,9 @@ test-all:           ## every test, including the ones that spawn real processes
 
 hello:              ## A1 done-when: 4-process gloo hello-world
 	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) -m dtp.hello
+
+crops:              ## build the crop manifest from nuScenes (run once)
+	uv run python -m dtp.build_crops --dataroot $(DTP_NUSCENES_ROOT) --out $(CROPS)
 
 probe:              ## report how DataLoader workers are started on this machine
 	uv run python -m dtp.probe
