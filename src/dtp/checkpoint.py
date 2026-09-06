@@ -32,11 +32,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -120,6 +122,30 @@ def atomic_write_json(payload: dict, path: Path) -> None:
         raise
 
 
+def rng_state() -> dict:
+    """Capture every generator the training loop draws from.
+
+    Not needed for continuity *today*: with no augmentation and an epoch-seeded
+    sampler, data order is a pure function of the epoch number. It will be needed in
+    B5, which adds per-worker augmentation, and restoring it costs nothing now while
+    retrofitting it later would silently invalidate any resume written before the
+    change.
+    """
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+
+
+def restore_rng_state(state: dict | None) -> None:
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+
+
 @dataclass(frozen=True)
 class CheckpointMeta:
     """What the marker file records about a checkpoint."""
@@ -172,6 +198,11 @@ class CheckpointManager:
                 # the resumed run re-sees data it already trained on.
                 "sampler_epoch": sampler_epoch,
                 "val_loss": val_loss,
+                # Rank 0's generators only. On a resume with a different world size
+                # this restores one rank's stream to all of them, which is wrong in
+                # principle; it is recorded in the marker as world_size so a future
+                # check can refuse the mismatch.
+                "rng": rng_state(),
                 **(extra or {}),
             }
             filename = f"ckpt_epoch{epoch:04d}.pt"

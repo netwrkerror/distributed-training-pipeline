@@ -12,6 +12,7 @@ Runs driver-side against the small `sample` / `sample_data` metadata tables (not
 actual image/lidar bytes), producing a lightweight list that the ingest stage can
 turn into a Ray Dataset lazily.
 """
+
 from __future__ import annotations
 
 import os

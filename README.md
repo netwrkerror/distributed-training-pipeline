@@ -26,7 +26,7 @@ inference, this one is training. `src/dtp/manifest.py` is copied from it, with a
 | A4 | DDP wrapper | ✅ |
 | A5 | DistributedSampler and the no-duplicate assertion | ✅ |
 | A6 | Checkpointing | ✅ |
-| A7 | Resume | ⬜ |
+| A7 | Resume | ✅ |
 | A8 | Fault injection and recovery | ⬜ |
 | **B — Measure and fix the input pipeline** | | |
 | B1 | DataLoader-only throughput harness | ⬜ |
@@ -48,6 +48,7 @@ make doctor     # check the host for defects that make distributed runs hang
 make hello      # 4-process gloo hello-world: rank, world_size, and a checked all_reduce
 make train      # single-process training baseline
 make ddp        # the same loop across 4 gloo processes
+make resume     # continue from the latest checkpoint
 make check-ddp  # assert DDP really averages gradients across ranks
 make check-sampler  # assert the ranks partition the dataset exactly
 make test       # fast tests
@@ -66,71 +67,27 @@ keyframes, with the long-tailed distribution you would expect (car 48.0%, traile
 
 ## Notes from the work so far
 
-**A corrupt checkpoint does not announce itself.** `torch.save` writes a zip container, so a
-*truncated* checkpoint is caught by the format. A single flipped byte is not: the file loads
-without complaint, the weights come back finite and plausibly scaled, and training resumes from
-silently wrong parameters. Measured on a real checkpoint — byte flips at 50% and 90% of the file
-both loaded happily. Checkpoints here record a sha256 in the marker and verify it on load.
+One line each; the reasoning behind them is in the merged PR descriptions.
 
-**Checkpoint writes are atomic**: temp file in the destination directory → `fsync` the file →
-`os.replace` → `fsync` the directory. The naive `torch.save(state, "latest.pt")` overwrites the
-only good copy in place, so a crash during the write destroys the checkpoint you were keeping in
-order to survive crashes.
-
-**Sharding is where distribution finally pays.** Without `DistributedSampler` all four ranks
-iterate the whole dataset: 32.6s per epoch to reproduce the single-process result exactly. With
-it, each rank takes a disjoint 802-record shard and the epoch drops to 7.2s — 2.8× faster than
-the 20.4s single-process baseline.
-
-**`DistributedSampler` pads, so "no duplicates" is not quite true.** Every rank must run the same
-number of steps, or one reaches the next collective alone and blocks. When the dataset does not
-divide evenly, `drop_last=False` repeats records from the front of the permutation: coverage is
-complete but `world_size - (n % world_size)` records appear twice in one epoch. The real split
-hides this (3208 and 896 are both divisible by 4); the tests assert the general case.
-
-**Learning-rate scaling made convergence worse, and it is reported that way.** At a real
-effective batch of 256, six epochs each: unscaled `3e-3` → 0.6031, √-scaled `6e-3` → 0.6679,
-linearly scaled `1.2e-2` → 0.7174. Monotonically worse with more scaling. The linear rule is SGD
-folklore that assumes a warmup this run does not have, and AdamW already decouples step size from
-gradient magnitude. Left unscaled by default.
-
-**Most of DDP's apparent slowdown was a launcher default, not the framework.** A naive
-before/after says DDP cost 2.4× per step (120.3ms → 284.6ms). Decomposed: single-process with
-one thread is already 226.9ms, because `torchrun` sets `OMP_NUM_THREADS=1` while a bare
-`python` run used seven threads. So 1.9× is threading and only 1.25× is gradient
-synchronisation. Comparing a launched run against an unlaunched one measures the launcher.
-
-**"Per-rank losses agree" does not prove gradients are synchronised.** With every rank seeing
-identical data from identical initial weights, the losses agree whether or not the all-reduce
-runs at all — so the obvious done-when is satisfiable by a broken implementation. `make check-ddp`
-asserts the real property: ranks given deliberately *different* data end up with bit-identical
-gradients equal to the mean of their independent local ones (agreement 1.5e-08, cross-rank
-disagreement 0.0, local gradients differing by 4.6e-01 so the check cannot pass vacuously).
-
-**Validation is split by scene, and the number is much worse for it.** There are ~10 crops per
-camera frame and consecutive frames show the same objects, so a record-level split puts
-near-duplicate crops of the same car on both sides. Measured directly: under a random split
-validation accuracy reaches 0.72–0.76 and val loss tracks train loss; under a scene-level split
-the same model gets 0.27–0.65 and val loss has no trend at all. The first number is the one a
-careless write-up would report. Training loss falls monotonically (1.14 → 0.23 over 10 epochs)
-either way — the loop is correct; the model simply does not generalise across scenes yet.
-
-**Run `make doctor` before anything else.** On a host that cannot resolve its own hostname, bare
-`torchrun` never completes rendezvous — it retries a failing lookup with exponential backoff and
-never times out into a useful error. On the development machine this also added ~55s to every
-run, because torch's elastic agent calls `socket.getfqdn()` once per worker lifecycle event to
-label a telemetry field, and each call cost a 5s resolver timeout. Eleven calls, 55.1s, on a job
-whose actual distributed work takes 29ms. `make hello` works around it with
-`--local-addr=127.0.0.1` and `GLOO_SOCKET_IFNAME=lo0`; `doctor` prints the real `/etc/hosts` fix.
-
-**nuScenes ships 3D boxes, not 2D.** Producing image crops means projecting each annotation
-through `world → ego → camera → pixels`. That math is written by hand in `src/dtp/geometry.py`
-rather than taken from `nuscenes-devkit`, which wants `numpy<2` and pulls in matplotlib, OpenCV,
-scikit-learn and shapely — too much to sit underneath a training loop. To keep the hand-rolled
-version honest, `tests/test_geometry.py` compares it against a fixture the devkit generated in a
-throwaway environment: 881 boxes, agreeing to **5e-05 m** on camera-frame corners and **5e-05 px**
-on projected boxes, which is the rounding floor of the fixture itself. The devkit is not a
-dependency of this project.
+- **Run `make doctor` first.** On a host that cannot resolve its own hostname, bare `torchrun`
+  never completes rendezvous, and torch's elastic agent adds ~55s per run calling
+  `socket.getfqdn()` to label a telemetry field — 11 calls at 5.007s, on a job whose distributed
+  work takes 29ms.
+- **Validation splits by scene, not by record.** With ~10 crops per frame, a record-level split
+  puts near-duplicate crops of the same car on both sides: 0.72–0.76 val accuracy against
+  0.27–0.65 for an honest split. The first number is the one a careless write-up reports.
+- **Most of DDP's apparent cost was a launcher default.** 120.3ms → 284.6ms per step looks like a
+  2.4× penalty; 1.9× of it is `torchrun` setting `OMP_NUM_THREADS=1`, and only 1.25× is gradient
+  synchronisation.
+- **"Per-rank losses agree" does not prove gradients are synchronised** — with identical data on
+  every rank it holds even with the all-reduce deleted. `make check-ddp` asserts the real
+  property against ranks given deliberately different data.
+- **A corrupt checkpoint usually loads without complaint.** Scanning one flipped byte across a
+  checkpoint, 12 of 19 positions loaded silently with finite, plausibly scaled weights; truncation
+  is caught by torch's zip container, bit corruption is not. Checkpoints here carry a sha256.
+- **DDP synchronises gradients, not state.** BatchNorm running statistics diverge 7.07e-03 across
+  ranks even with `broadcast_buffers=True`, so a rank-0 checkpoint is an incomplete snapshot of a
+  distributed run — which is why a DDP resume is continuous but not bit-exact.
 
 ## Layout
 

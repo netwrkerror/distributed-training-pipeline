@@ -204,40 +204,52 @@ def test_no_temp_files_survive_a_failed_write(
     assert leftovers == [], f"temp files left behind: {leftovers}"
 
 
-@pytest.mark.parametrize("position", [0.5, 0.9])
-def test_corrupt_checkpoint_is_rejected_not_resumed_from(tmp_path: Path, position: float) -> None:
-    """Gotcha 6, reproduced and then made impossible.
+def test_corruption_is_usually_silent_and_always_caught_by_the_checksum(tmp_path: Path) -> None:
+    """Gotcha 6, reproduced and quantified.
 
-    The premise of the gotcha is that a corrupt checkpoint is loaded *happily* by the
-    resume path, and it holds. torch.save writes a zip container, so a truncated file
-    is caught by the format itself - but a flipped byte is not, at 0.5 (metadata
-    region) or at 0.9 (inside the tensor payload). In the second case the weights come
-    back finite and plausibly scaled, so training resumes from silently wrong
-    parameters and simply gets worse for no visible reason.
+    Flipping one byte is *usually* invisible to torch.load. Whether it raises depends
+    entirely on where it lands: a flip inside the pickle metadata trips a decode
+    error, while a flip in the tensor payload comes back as finite, plausibly scaled
+    weights and no complaint at all.
 
-    The `verify=False` half of this test is not decoration: it is what demonstrates
-    that the checksum is doing the catching, rather than torch.load having noticed.
+    Both halves are asserted deliberately. The silent count is what proves the danger
+    is real; the "checksum caught every one" is what proves the fix covers the cases
+    torch.load misses, rather than being credited for work the zip format already did.
     """
     model = _model()
     manager = _manager(tmp_path)
     _save(manager, model, torch.optim.AdamW(model.parameters()), epoch=0, val_loss=1.0)
 
     target = manager.dir / manager.read_marker(LATEST).filename
-    data = bytearray(target.read_bytes())
-    data[int(len(data) * position)] ^= 0xFF
-    target.write_bytes(bytes(data))
+    original = target.read_bytes()
 
-    # unguarded, this is the bug: the corrupt file loads without complaint
-    smuggled = manager.load(verify=False)
-    assert smuggled["epoch"] == 0, "expected torch.load to accept the corrupt file"
+    silent = 0
+    positions = range(5, 100, 5)
+    for percent in positions:
+        data = bytearray(original)
+        data[int(len(data) * percent / 100)] ^= 0xFF
+        target.write_bytes(bytes(data))
 
-    # guarded, it is caught
-    with pytest.raises(ValueError, match="corrupt"):
-        manager.load()
+        try:
+            state = manager.load(verify=False)
+            assert state["epoch"] == 0
+            silent += 1
+        except Exception:  # torch noticed; that is the minority case
+            pass
+
+        # whatever torch did, verification must reject it
+        with pytest.raises(ValueError, match="corrupt"):
+            manager.load()
+
+    assert silent >= len(list(positions)) // 2, (
+        f"expected most single-byte corruptions to load silently, only {silent} did"
+    )
 
 
-def test_truncated_checkpoint_is_caught_by_the_container(tmp_path: Path) -> None:
-    """The one corruption torch.load does catch on its own, recorded for contrast."""
+def test_truncated_checkpoint_is_caught(tmp_path: Path) -> None:
+    """Truncation is the one corruption torch.load reliably catches on its own,
+    because torch.save writes a zip container and the central directory goes missing.
+    Recorded for contrast with the byte-flip case above."""
     model = _model()
     manager = _manager(tmp_path)
     _save(manager, model, torch.optim.AdamW(model.parameters()), epoch=0, val_loss=1.0)
@@ -245,8 +257,10 @@ def test_truncated_checkpoint_is_caught_by_the_container(tmp_path: Path) -> None
     target = manager.dir / manager.read_marker(LATEST).filename
     target.write_bytes(target.read_bytes()[: int(target.stat().st_size * 0.6)])
 
-    with pytest.raises((RuntimeError, EOFError, ValueError)):
+    with pytest.raises((OSError, RuntimeError, EOFError, ValueError)):
         manager.load(verify=False)
+    with pytest.raises(ValueError, match="corrupt"):
+        manager.load()
 
 
 def test_marker_pointing_at_a_missing_file_raises(tmp_path: Path) -> None:

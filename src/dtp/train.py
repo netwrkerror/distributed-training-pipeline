@@ -36,7 +36,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
-from dtp.checkpoint import CheckpointManager
+from dtp.checkpoint import CheckpointManager, restore_rng_state, unwrap_model
 from dtp.dataset import CropDataset
 from dtp.dist import all_gather_scalar, context_from_env, process_group, setup_logging
 from dtp.metrics import ClassificationMetrics
@@ -136,6 +136,17 @@ def main() -> None:
     ap.add_argument("--checkpoint-dir", default="checkpoints")
     ap.add_argument("--keep-last", type=int, default=3, help="checkpoints to retain, plus best")
     ap.add_argument("--no-checkpoint", action="store_true", help="disable checkpoint writing")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue from the checkpoint latest.json points at, if one exists",
+    )
+    ap.add_argument(
+        "--ignore-sampler-epoch",
+        action="store_true",
+        help="on resume, restart the sampler at epoch 0 instead of continuing "
+        "(the silent bug this feature exists to prevent)",
+    )
     ap.add_argument("--backend", default="gloo", help="torch.distributed backend")
     ap.add_argument(
         "--threads",
@@ -211,6 +222,12 @@ def _run(args: argparse.Namespace, ctx) -> None:
         else None
     )
 
+    # Without a DistributedSampler, shuffling draws from a generator rather than the
+    # global RNG, and that generator is re-seeded per epoch below. This gives the
+    # single-process path the same property DistributedSampler already has: data order
+    # is a pure function of (seed, epoch), so a resumed run can be *exactly* continuous
+    # rather than merely similar.
+    order_generator = torch.Generator()
     train_loader = DataLoader(
         train_subset,
         batch_size=args.batch_size,
@@ -218,6 +235,7 @@ def _run(args: argparse.Namespace, ctx) -> None:
         sampler=train_sampler,
         num_workers=args.num_workers,
         drop_last=False,
+        generator=order_generator if train_sampler is None else None,
     )
     val_loader = DataLoader(
         val_subset,
@@ -275,13 +293,43 @@ def _run(args: argparse.Namespace, ctx) -> None:
         args.checkpoint_dir, keep_last=args.keep_last, is_master=ctx.is_master
     )
     global_step = 0
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if args.resume:
+        state = checkpoints.load()
+        if state is None:
+            log.info("--resume given but no checkpoint found; starting fresh")
+        else:
+            unwrap_model(model).load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            global_step = state["global_step"]
+            start_epoch = state["epoch"] + 1
+            restore_rng_state(state.get("rng"))
+            # The line the whole feature turns on. Restoring weights and step count
+            # while restarting the sampler at 0 gives a run that looks correct and
+            # silently re-trains on data it has already seen.
+            resume_sampler_epoch = 0 if args.ignore_sampler_epoch else state["sampler_epoch"] + 1
+            log.info(
+                "resumed from epoch %d (global_step %d), sampler continues at epoch %d",
+                state["epoch"],
+                global_step,
+                resume_sampler_epoch,
+            )
+            if args.ignore_sampler_epoch:
+                log.warning("--ignore-sampler-epoch: data order restarts from scratch")
+
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         epoch_start = time.perf_counter()
+        # Data order is keyed on the epoch number, so a resumed run continues the
+        # sequence instead of replaying it. --ignore-sampler-epoch offsets it back to
+        # zero to demonstrate the bug.
+        sampler_epoch = epoch - start_epoch if args.ignore_sampler_epoch and args.resume else epoch
         if train_sampler is not None and not args.no_set_epoch:
             # Without this the sampler stays on epoch 0 and reshuffles to the same
             # permutation forever. Nothing crashes; the data order simply freezes.
-            train_sampler.set_epoch(epoch)
+            train_sampler.set_epoch(sampler_epoch)
+        elif train_sampler is None:
+            order_generator.manual_seed(args.seed + sampler_epoch)
         train_metrics, step_times = train_one_epoch(
             model, train_loader, criterion, optimizer, num_classes, args.sync_each_step
         )
@@ -322,7 +370,7 @@ def _run(args: argparse.Namespace, ctx) -> None:
             "epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_acc=%.3f  val_macro_recall=%.3f  "
             "step_median=%.1fms  epoch=%.1fs",
             epoch + 1,
-            args.epochs,
+            start_epoch + args.epochs,
             train_metrics.loss,
             val_metrics.loss,
             val_metrics.accuracy,
@@ -345,7 +393,7 @@ def _run(args: argparse.Namespace, ctx) -> None:
                 optimizer=optimizer,
                 epoch=epoch,
                 global_step=global_step,
-                sampler_epoch=epoch,
+                sampler_epoch=sampler_epoch,
                 val_loss=val_metrics.loss,
             )
             if meta is not None:
