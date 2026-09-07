@@ -26,6 +26,7 @@ import json
 import os
 import random
 import statistics
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -39,6 +40,7 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 from dtp.checkpoint import CheckpointManager, restore_rng_state, unwrap_model
 from dtp.dataset import CropDataset
 from dtp.dist import all_gather_scalar, context_from_env, process_group, setup_logging
+from dtp.faults import enable_stack_dumps
 from dtp.metrics import ClassificationMetrics
 from dtp.model import SmallCNN, count_parameters
 from dtp.splits import random_split, scene_split
@@ -142,6 +144,13 @@ def main() -> None:
         help="continue from the checkpoint latest.json points at, if one exists",
     )
     ap.add_argument(
+        "--crash-at-epoch",
+        type=int,
+        default=None,
+        help="A8 fault injection: rank 0 dies abruptly at this epoch, but only on the "
+        "first attempt (TORCHELASTIC_RESTART_COUNT == 0), so --max-restarts can recover",
+    )
+    ap.add_argument(
         "--ignore-sampler-epoch",
         action="store_true",
         help="on resume, restart the sampler at epoch 0 instead of continuing "
@@ -180,6 +189,11 @@ def main() -> None:
         help="call loss.item() every step (gotcha 7); default accumulates on-device",
     )
     args = ap.parse_args()
+
+    # Arm SIGUSR1 stack dumps before anything can hang. py-spy needs root on macOS;
+    # this needs none, and a training job that cannot be interrogated when it stalls
+    # is a training job you debug by guessing.
+    enable_stack_dumps()
 
     ctx = context_from_env()
     # A single process needs no process group; entering one would mean a rendezvous
@@ -318,8 +332,28 @@ def _run(args: argparse.Namespace, ctx) -> None:
             if args.ignore_sampler_epoch:
                 log.warning("--ignore-sampler-epoch: data order restarts from scratch")
 
-    for epoch in range(start_epoch, start_epoch + args.epochs):
+    # --epochs is a *target*, not a budget of additional epochs. Under
+    # `torchrun --max-restarts` the same command line is re-executed after every
+    # failure, so "run N more" would silently extend the job by N epochs per crash and
+    # a job that failed three times would train for three extra epochs. A target is
+    # also the only interpretation under which a resumed run and an uninterrupted one
+    # are comparable.
+    if start_epoch >= args.epochs:
+        log.info("target of %d epochs already reached at epoch %d", args.epochs, start_epoch)
+    for epoch in range(start_epoch, args.epochs):
         epoch_start = time.perf_counter()
+
+        if args.crash_at_epoch is not None and epoch == args.crash_at_epoch:
+            # torchrun sets TORCHELASTIC_RESTART_COUNT in every worker's environment,
+            # so the injected fault can fire on the first attempt and not on the retry.
+            # Without that the job would fail, restart, and fail again identically
+            # until --max-restarts ran out.
+            attempt = int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0"))
+            if attempt == 0 and ctx.is_master:
+                log.warning("injected fault: dying at epoch %d (attempt %d)", epoch, attempt)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(137)
         # Data order is keyed on the epoch number, so a resumed run continues the
         # sequence instead of replaying it. --ignore-sampler-epoch offsets it back to
         # zero to demonstrate the bug.
@@ -370,7 +404,7 @@ def _run(args: argparse.Namespace, ctx) -> None:
             "epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_acc=%.3f  val_macro_recall=%.3f  "
             "step_median=%.1fms  epoch=%.1fs",
             epoch + 1,
-            start_epoch + args.epochs,
+            args.epochs,
             train_metrics.loss,
             val_metrics.loss,
             val_metrics.accuracy,

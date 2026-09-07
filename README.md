@@ -27,7 +27,7 @@ inference, this one is training. `src/dtp/manifest.py` is copied from it, with a
 | A5 | DistributedSampler and the no-duplicate assertion | ✅ |
 | A6 | Checkpointing | ✅ |
 | A7 | Resume | ✅ |
-| A8 | Fault injection and recovery | ⬜ |
+| A8 | Fault injection and recovery | ✅ |
 | **B — Measure and fix the input pipeline** | | |
 | B1 | DataLoader-only throughput harness | ⬜ |
 | B2 | Find and explain the knee | ⬜ |
@@ -85,6 +85,11 @@ One line each; the reasoning behind them is in the merged PR descriptions.
 - **A corrupt checkpoint usually loads without complaint.** Scanning one flipped byte across a
   checkpoint, 12 of 19 positions loaded silently with finite, plausibly scaled weights; truncation
   is caught by torch's zip container, bit corruption is not. Checkpoints here carry a sha256.
+- **A killed worker and an uneven data split fail completely differently.** `torchrun`
+  supervises its children, so a dead rank ends the job (after ~18s of silence — a floor
+  independent of the collective timeout) rather than hanging. An uneven split kills nothing:
+  all ranks stay healthy while one sits in `all_reduce` and the rest sit in `barrier`, until
+  gloo's timeout — 30 minutes by default.
 - **DDP synchronises gradients, not state.** BatchNorm running statistics diverge 7.07e-03 across
   ranks even with `broadcast_buffers=True`, so a rank-0 checkpoint is an incomplete snapshot of a
   distributed run — which is why a DDP resume is continuous but not bit-exact.
