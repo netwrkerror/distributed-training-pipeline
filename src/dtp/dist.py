@@ -14,6 +14,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch.distributed as dist
 
@@ -96,7 +97,9 @@ def all_gather_scalar(value: float) -> list[float]:
 
 
 @contextmanager
-def process_group(backend: str = DEFAULT_BACKEND) -> Iterator[DistContext]:
+def process_group(
+    backend: str = DEFAULT_BACKEND, timeout_s: float | None = None
+) -> Iterator[DistContext]:
     """Initialize the process group, yield the context, always tear it down.
 
     init_process_group is a collective: it returns only once every rank in
@@ -104,7 +107,13 @@ def process_group(backend: str = DEFAULT_BACKEND) -> Iterator[DistContext]:
     others block here rather than failing fast.
     """
     ctx = context_from_env()
-    dist.init_process_group(backend=backend)
+    # gloo's default collective timeout is 30 minutes. That is a sensible production
+    # value - a slow rank is not a dead rank - and a useless one for watching a hang
+    # on purpose, which is what A8's fault injection needs.
+    kwargs = {}
+    if timeout_s is not None:
+        kwargs["timeout"] = timedelta(seconds=timeout_s)
+    dist.init_process_group(backend=backend, **kwargs)
     try:
         yield ctx
     finally:

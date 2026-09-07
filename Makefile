@@ -1,4 +1,4 @@
-.PHONY: install lint fmt test test-all hello probe doctor crops train ddp resume check-ddp check-sampler check
+.PHONY: install lint fmt test test-all hello probe doctor crops train ddp resume fault-kill fault-uneven recover check-ddp check-sampler check
 
 NPROC ?= 4
 
@@ -54,6 +54,19 @@ check-sampler:      ## assert the ranks partition the dataset exactly, and show 
 resume:             ## continue from the latest checkpoint
 	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
 		-m dtp.train --epochs $(EPOCHS) --resume
+
+fault-kill:         ## A8: kill a rank mid-run and watch what happens
+	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
+		-m dtp.faults kill-rank --timeout 25
+
+fault-uneven:       ## A8: ranks disagree on epoch length; hangs until the timeout
+	$(GLOO_ENV) uv run torchrun $(TORCHRUN_FLAGS) --nproc_per_node=$(NPROC) \
+		-m dtp.faults uneven-shards --timeout 25
+
+recover:            ## A8 done-when: survive a killed worker and resume from checkpoint
+	$(GLOO_ENV) uv run torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:29500 \
+		--local-addr=127.0.0.1 --max-restarts=2 --nproc_per_node=$(NPROC) \
+		-m dtp.train --epochs $(EPOCHS) --resume --crash-at-epoch 2
 
 probe:              ## report how DataLoader workers are started on this machine
 	uv run python -m dtp.probe
